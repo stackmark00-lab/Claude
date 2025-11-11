@@ -2,7 +2,14 @@
     Remove-Webex.ps1
     Purpose : Remove Cisco Webex ONLY (safely & idempotently, without affecting other Cisco apps)
     Author  : SecOps
-    Version : 2.1 (Webex-only, AnyConnect safe)
+    Version : 2.2 (Multi-version support: <45, WBS 42, Meetings Client 43.8.0+)
+
+    Supported versions:
+      - Webex versions below 45
+      - WBS (Webex Bridges Service) 42.x
+      - WebEx Meetings Client 43.8.0 and newer
+      - Webex Productivity Tools
+
     Exit codes:
       0     = Webex not found / successfully removed (no reboot needed)
       3010  = Removed and reboot recommended
@@ -15,8 +22,9 @@ $LogRoot   = "C:\ProgramData\WebexRemoval"
 $LogFile   = Join-Path $LogRoot ("WebexRemoval_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
 
 # WEBEX-ONLY patterns (excludes AnyConnect, Cisco VPN, etc.)
-$KillMatch = 'webex|ciscocollabhost|ptone|ptoneclk|atmgr|ciscowebex|wxm|wbx'
-$SvcMatch  = 'webex|ciscocollabhost'  # REMOVED generic 'cisco' to protect AnyConnect
+# Supports: Webex <45, WBS 42, Meetings Client 43.8.0 and newer
+$KillMatch = 'webex|ciscocollabhost|ptone|ptoneclk|atmgr|ciscowebex|wxm|wbx|webexservice|webexmngr|CiscoJabber'
+$SvcMatch  = 'webex|ciscocollabhost|webexservice'  # REMOVED generic 'cisco' to protect AnyConnect
 
 # Services to EXCLUDE (do not stop)
 $ExcludedServices = @(
@@ -33,21 +41,61 @@ $RegUninstallPaths = @(
   'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
 
-# Folders - WEBEX ONLY
+# Folders - WEBEX ONLY (covers versions <45, WBS 42, Meetings Client 43.8.0+)
 $Folders = @(
+  # Current/Modern paths
   "$env:LOCALAPPDATA\Webex",
   "$env:APPDATA\Webex",
   "$env:ProgramFiles\Webex",
   "$env:ProgramFiles(x86)\Webex",
   "$env:ProgramFiles\Cisco Webex",
   "$env:ProgramFiles(x86)\Cisco Webex",
-  "$env:USERPROFILE\AppData\Local\Temp\WebEx"
+  "$env:USERPROFILE\AppData\Local\Temp\WebEx",
+
+  # Older version paths (pre-v45)
+  "$env:ProgramFiles\Cisco\Webex",
+  "$env:ProgramFiles(x86)\Cisco\Webex",
+  "$env:ProgramFiles\Cisco Systems\Webex",
+  "$env:ProgramFiles(x86)\Cisco Systems\Webex",
+  "$env:LOCALAPPDATA\Cisco",
+  "$env:APPDATA\Cisco",
+
+  # WebEx Meetings Client specific
+  "$env:ProgramFiles\WebEx",
+  "$env:ProgramFiles(x86)\WebEx",
+  "$env:LOCALAPPDATA\WebEx",
+  "$env:APPDATA\WebEx",
+
+  # WBS (Webex Bridges Service) paths
+  "$env:ProgramFiles\Cisco\WebEx Bridges",
+  "$env:ProgramFiles(x86)\Cisco\WebEx Bridges",
+
+  # Productivity Tools paths
+  "$env:ProgramFiles\Cisco\WebEx Productivity Tools",
+  "$env:ProgramFiles(x86)\Cisco\WebEx Productivity Tools"
 )
 
-# Registry keys - WEBEX ONLY
+# Registry keys - WEBEX ONLY (covers versions <45, WBS 42, Meetings Client 43.8.0+)
 $RegKeys = @(
+  # Modern paths
   'HKCU:\Software\Webex',
-  'HKLM:\Software\Webex'
+  'HKLM:\Software\Webex',
+  'HKCU:\Software\Cisco\Webex',
+  'HKLM:\Software\Cisco\Webex',
+
+  # Older version paths
+  'HKCU:\Software\Cisco Systems\Webex',
+  'HKLM:\Software\Cisco Systems\Webex',
+  'HKCU:\Software\Cisco Systems\WebEx',
+  'HKLM:\Software\Cisco Systems\WebEx',
+
+  # WebEx Meetings Client paths
+  'HKCU:\Software\WebEx',
+  'HKLM:\Software\WebEx',
+
+  # WBS paths
+  'HKCU:\Software\Cisco\WebEx Bridges',
+  'HKLM:\Software\Cisco\WebEx Bridges'
 )
 
 #--- Helpers ----------------------------------------------------------------
@@ -341,6 +389,7 @@ try {
 
   Ensure-Log
   Write-Host "=== Webex Force Removal (WEBEX ONLY) - Start === $(Get-Date)" -ForegroundColor Cyan
+  Write-Host "Version: 2.2 | Supports: Webex <45, WBS 42.x, Meetings Client 43.8.0+" -ForegroundColor Cyan
   Write-Host "User: $($env:USERNAME) | Computer: $($env:COMPUTERNAME)" -ForegroundColor Cyan
   Write-Host "WARNING: This will ONLY remove Webex. Other Cisco apps (AnyConnect, VPN) are protected." -ForegroundColor Yellow
 
