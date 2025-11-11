@@ -1,266 +1,54 @@
 #requires -RunAsAdministrator
-<#
-.SYNOPSIS
-OneDrive Complete Removal - Check and Remove in one script
-.NOTES
-Exit codes: 0=removed, 3010=reboot needed, 1=error
-Works with: Zscaler, Cisco AnyConnect, F5, and other VPNs (no disconnection needed)
-#>
+Write-Host "=== OneDrive Removal ===" -ForegroundColor Cyan
 
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
-if (-not $isAdmin) { Write-Error "Must run as Administrator"; exit 1 }
-
-Write-Host "=== OneDrive Complete Removal ===" -ForegroundColor Cyan
-Write-Host "VPN Compatible (Zscaler, AnyConnect, etc.)" -ForegroundColor Green
-Write-Host ""
-
-# ============== PHASE 1: CHECK WHAT EXISTS ==============
-Write-Host "[PHASE 1] Checking for OneDrive traces..." -ForegroundColor Yellow
-
-$foundItems = @()
-
-# Check processes
-$procs = Get-Process -Name "*onedrive*", "*filecoauth*" -ErrorAction SilentlyContinue
-if ($procs) {
-    Write-Host "  [!] Processes found: $($procs.Count)"
-    $procs | ForEach-Object { Write-Host "      - $($_.Name) (PID: $($_.Id))"; $foundItems += $_ }
+# Check admin
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
+    Write-Error "Must run as Administrator"; exit 1
 }
 
-# Check services
-$svcs = Get-Service -Name "*onedrive*" -ErrorAction SilentlyContinue
-if ($svcs) {
-    Write-Host "  [!] Services found: $($svcs.Count)"
-    $svcs | ForEach-Object { Write-Host "      - $($_.DisplayName)"; $foundItems += $_ }
-}
+# Phase 1: Check
+Write-Host "`n[1/3] Checking..." -ForegroundColor Yellow
+$procs = Get-Process -Name "*onedrive*", "*filecoauth*" -EA 0
+$appx = Get-AppxPackage -Name "*OneDrive*" -EA 0
+$svcs = Get-Service -Name "*onedrive*" -EA 0
+$progs = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA 0 | Where-Object { $_.DisplayName -match 'OneDrive' }
 
-# Check AppX packages (CRITICAL)
-$appx = Get-AppxPackage -Name "*OneDrive*" -ErrorAction SilentlyContinue
-if ($appx) {
-    Write-Host "  [!] AppX packages found: $($appx.Count)"
-    $appx | ForEach-Object { Write-Host "      - $($_.Name) (Version: $($_.Version))"; $foundItems += $_ }
-}
-
-# Check installed programs
-$progs = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName -match 'OneDrive' }
-if ($progs) {
-    Write-Host "  [!] Installed programs found: $($progs.Count)"
-    $progs | ForEach-Object { Write-Host "      - $($_.DisplayName) ($($_.DisplayVersion))"; $foundItems += $_ }
-}
-
-# Check file paths
-$filePaths = @(
-    "$env:LOCALAPPDATA\Microsoft\OneDrive",
-    "$env:APPDATA\Microsoft\OneDrive",
-    "$env:ProgramFiles\Microsoft OneDrive",
-    "$env:ProgramFiles(x86)\Microsoft OneDrive",
-    "$env:ProgramData\Microsoft OneDrive",
-    "$env:USERPROFILE\OneDrive"
-)
-$existingPaths = @()
-$filePaths | ForEach-Object {
-    if (Test-Path $_) {
-        Write-Host "  [!] File path found: $_"
-        $existingPaths += $_
-    }
-}
-
-# Check registry keys
-$regKeys = @(
-    'HKCU:\Software\Microsoft\OneDrive',
-    'HKLM:\Software\Microsoft\OneDrive',
-    'HKLM:\Software\WOW6432Node\Microsoft\OneDrive'
-)
-$existingKeys = @()
-$regKeys | ForEach-Object {
-    if (Test-Path $_) {
-        Write-Host "  [!] Registry key found: $_"
-        $existingKeys += $_
-    }
-}
-
-if ($foundItems.Count -eq 0 -and $existingPaths.Count -eq 0 -and $existingKeys.Count -eq 0) {
-    Write-Host "  [✓] No OneDrive traces found - System is clean" -ForegroundColor Green
+if (-not ($procs -or $appx -or $svcs -or $progs)) {
+    Write-Host "[✓] Clean - No OneDrive found" -ForegroundColor Green
     exit 0
 }
 
-# ============== PHASE 2: REMOVE EVERYTHING ==============
-Write-Host "`n[PHASE 2] Removing OneDrive..." -ForegroundColor Yellow
+# Phase 2: Remove
+Write-Host "[2/3] Removing..." -ForegroundColor Yellow
+$procs | Stop-Process -Force -EA 0
+$svcs | ForEach-Object { Stop-Service -Name $_.Name -Force -EA 0; Set-Service -Name $_.Name -StartupType Disabled -EA 0 }
+$appx | ForEach-Object { Remove-AppxPackage -Package $_.PackageFullName -EA 0; Remove-AppxPackage -Package $_.PackageFullName -Force -EA 0 }
+Get-AppxProvisionedPackage -Online -EA 0 | Where-Object { $_.DisplayName -match 'OneDrive' } | ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -EA 0 }
+$progs | ForEach-Object { if ($_.PSChildName) { msiexec.exe /x $_.PSChildName /quiet /norestart 2>$null } }
 
-# Kill processes
-if ($procs) {
-    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-    Write-Host "  [✓] Killed processes"
-    Start-Sleep -Seconds 2
-}
+@("$env:LOCALAPPDATA\Microsoft\OneDrive", "$env:APPDATA\Microsoft\OneDrive", "$env:ProgramFiles\Microsoft OneDrive", "$env:ProgramFiles(x86)\Microsoft OneDrive", "$env:ProgramData\Microsoft OneDrive", "$env:USERPROFILE\OneDrive") |
+    ForEach-Object { if (Test-Path $_) { Remove-Item $_ -Recurse -Force -EA 0 } }
 
-# Stop and disable services
-if ($svcs) {
-    $svcs | ForEach-Object {
-        Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
-        Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
-    }
-    Write-Host "  [✓] Stopped/disabled services"
-    Start-Sleep -Seconds 2
-}
+@('HKCU:\Software\Microsoft\OneDrive', 'HKLM:\Software\Microsoft\OneDrive', 'HKLM:\Software\WOW6432Node\Microsoft\OneDrive') |
+    ForEach-Object { if (Test-Path $_) { Remove-Item $_ -Recurse -Force -EA 0 } }
 
-# Remove AppX packages (CRITICAL)
-if ($appx) {
-    Write-Host "  [*] Removing AppX packages..."
-    foreach ($package in $appx) {
-        try {
-            Remove-AppxPackage -Package $package.PackageFullName -ErrorAction SilentlyContinue
-            Write-Host "      [✓] Removed: $($package.Name)"
-        } catch {
-            Write-Host "      [!] Failed: $($package.Name) - Retrying..."
-            Start-Sleep -Seconds 1
-            try {
-                Remove-AppxPackage -Package $package.PackageFullName -Force -ErrorAction SilentlyContinue
-                Write-Host "      [✓] Removed (retry): $($package.Name)"
-            } catch {
-                Write-Host "      [!] Still failed: $($package.Name)"
-            }
-        }
-    }
-    Start-Sleep -Seconds 2
-}
+Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name "OneDrive" -EA 0
+Remove-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name "OneDrive" -EA 0
 
-# Remove provisioned packages
-Write-Host "  [*] Removing provisioned packages..."
-$provisionedPackages = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'OneDrive' }
-if ($provisionedPackages) {
-    foreach ($package in $provisionedPackages) {
-        try {
-            Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -ErrorAction SilentlyContinue
-            Write-Host "      [✓] Removed: $($package.DisplayName)"
-        } catch {
-            Write-Host "      [!] Failed: $($package.DisplayName)"
-        }
-    }
-} else {
-    Write-Host "      [✓] No provisioned packages found"
-}
-Start-Sleep -Seconds 1
+$regPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
+if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+Set-ItemProperty -Path $regPath -Name "DisableFileSyncNGSC" -Value 1 -Type DWord -EA 0
 
-# Uninstall via registry
-if ($progs) {
-    Write-Host "  [*] Running MSI uninstallers..."
-    foreach ($app in $progs) {
-        if ($app.PSChildName) {
-            try {
-                Start-Process -FilePath "msiexec.exe" -ArgumentList "/x", $app.PSChildName, "/quiet", "/norestart" -Wait -NoNewWindow -ErrorAction SilentlyContinue
-                Write-Host "      [✓] Uninstalled: $($app.DisplayName)"
-            } catch {
-                Write-Host "      [!] Failed: $($app.DisplayName)"
-            }
-        }
-    }
-    Start-Sleep -Seconds 2
-}
+Write-Host "[✓] Removed" -ForegroundColor Green
 
-# Delete file paths (with retry for locked files)
-if ($existingPaths.Count -gt 0) {
-    Write-Host "  [*] Deleting file paths..."
-    foreach ($path in $existingPaths) {
-        $retryCount = 0
-        $deleted = $false
-        while ($retryCount -lt 3 -and -not $deleted) {
-            try {
-                Remove-Item $path -Recurse -Force -ErrorAction Stop
-                Write-Host "      [✓] Deleted: $path"
-                $deleted = $true
-            } catch {
-                $retryCount++
-                if ($retryCount -lt 3) {
-                    Write-Host "      [*] Retrying (attempt $retryCount): $path"
-                    Start-Sleep -Seconds 2
-                } else {
-                    Write-Host "      [!] Failed to delete: $path (may require reboot)"
-                }
-            }
-        }
-    }
-}
+# Phase 3: Verify
+Write-Host "[3/3] Verifying..." -ForegroundColor Yellow
+$remaining = (Get-AppxPackage -Name "*OneDrive*" -EA 0) -or (Get-Process -Name "onedrive", "filecoauth" -EA 0) -or (Get-Service -Name "*OneDrive*" -EA 0) -or (Test-Path "$env:ProgramFiles\Microsoft OneDrive")
 
-# Clean registry
-if ($existingKeys.Count -gt 0) {
-    Write-Host "  [*] Cleaning registry..."
-    foreach ($key in $existingKeys) {
-        try {
-            Remove-Item $key -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "      [✓] Removed: $key"
-        } catch {
-            Write-Host "      [!] Failed to remove: $key"
-        }
-    }
-}
-
-# Remove from startup
-Write-Host "  [*] Removing from startup..."
-Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name "OneDrive" -ErrorAction SilentlyContinue
-Remove-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name "OneDrive" -ErrorAction SilentlyContinue
-Write-Host "      [✓] Removed startup entries"
-
-# Disable via Group Policy
-Write-Host "  [*] Disabling OneDrive policy..."
-try {
-    $regPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
-    if (-not (Test-Path $regPath)) {
-        New-Item -Path $regPath -Force | Out-Null
-    }
-    Set-ItemProperty -Path $regPath -Name "DisableFileSyncNGSC" -Value 1 -Type DWord -ErrorAction SilentlyContinue
-    Write-Host "      [✓] Disabled via policy"
-} catch {
-    Write-Host "      [!] Could not set policy (may be blocked by VPN/GPO)"
-}
-
-# ============== PHASE 3: FINAL VERIFICATION ==============
-Write-Host "`n[PHASE 3] Final verification..." -ForegroundColor Yellow
-
-$appxRemaining = Get-AppxPackage -Name "*OneDrive*" -ErrorAction SilentlyContinue
-$procRemaining = Get-Process -Name "onedrive", "filecoauth" -ErrorAction SilentlyContinue
-$svcRemaining = Get-Service -Name "*OneDrive*" -ErrorAction SilentlyContinue
-$fileRemaining = $false
-$regRemaining = $false
-
-foreach ($path in $filePaths) {
-    if (Test-Path $path) {
-        $fileRemaining = $true
-        Write-Host "  [!] File path still exists: $path"
-    }
-}
-
-foreach ($key in $regKeys) {
-    if (Test-Path $key) {
-        $regRemaining = $true
-        Write-Host "  [!] Registry key still exists: $key"
-    }
-}
-
-if ($appxRemaining) {
-    Write-Host "  [!] AppX packages still present:" -ForegroundColor Red
-    $appxRemaining | ForEach-Object { Write-Host "      - $($_.Name)" }
-}
-
-if ($procRemaining) {
-    Write-Host "  [!] Processes still running:" -ForegroundColor Red
-    $procRemaining | ForEach-Object { Write-Host "      - $($_.Name)" }
-}
-
-if ($svcRemaining) {
-    Write-Host "  [!] Services still present:" -ForegroundColor Red
-    $svcRemaining | ForEach-Object { Write-Host "      - $($_.DisplayName)" }
-}
-
-# Final result
-Write-Host ""
-if ($appxRemaining -or $procRemaining -or $svcRemaining -or $fileRemaining -or $regRemaining) {
-    Write-Host "[!] OneDrive still detected - REBOOT REQUIRED" -ForegroundColor Yellow
-    Write-Host "    After reboot, run this script again or check with Qualys" -ForegroundColor Yellow
-    Write-Host "    If still connected to VPN: No need to disconnect, script works with VPN" -ForegroundColor Yellow
+if ($remaining) {
+    Write-Host "[!] Reboot required - Exit 3010" -ForegroundColor Yellow
     exit 3010
 } else {
-    Write-Host "[✓] OneDrive completely removed successfully!" -ForegroundColor Green
-    Write-Host "    System is ready for Qualys re-scan" -ForegroundColor Green
+    Write-Host "[✓] Success - Ready for Qualys re-scan" -ForegroundColor Green
     exit 0
 }
