@@ -4,15 +4,18 @@
 OneDrive Complete Removal - Check and Remove in one script
 .NOTES
 Exit codes: 0=removed, 3010=reboot needed, 1=error
+Works with: Zscaler, Cisco AnyConnect, F5, and other VPNs (no disconnection needed)
 #>
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')
 if (-not $isAdmin) { Write-Error "Must run as Administrator"; exit 1 }
 
 Write-Host "=== OneDrive Complete Removal ===" -ForegroundColor Cyan
+Write-Host "VPN Compatible (Zscaler, AnyConnect, etc.)" -ForegroundColor Green
+Write-Host ""
 
 # ============== PHASE 1: CHECK WHAT EXISTS ==============
-Write-Host "`n[PHASE 1] Checking for OneDrive traces..." -ForegroundColor Yellow
+Write-Host "[PHASE 1] Checking for OneDrive traces..." -ForegroundColor Yellow
 
 $foundItems = @()
 
@@ -88,6 +91,7 @@ Write-Host "`n[PHASE 2] Removing OneDrive..." -ForegroundColor Yellow
 if ($procs) {
     $procs | Stop-Process -Force -ErrorAction SilentlyContinue
     Write-Host "  [✓] Killed processes"
+    Start-Sleep -Seconds 2
 }
 
 # Stop and disable services
@@ -97,6 +101,7 @@ if ($svcs) {
         Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
     }
     Write-Host "  [✓] Stopped/disabled services"
+    Start-Sleep -Seconds 2
 }
 
 # Remove AppX packages (CRITICAL)
@@ -107,9 +112,17 @@ if ($appx) {
             Remove-AppxPackage -Package $package.PackageFullName -ErrorAction SilentlyContinue
             Write-Host "      [✓] Removed: $($package.Name)"
         } catch {
-            Write-Host "      [!] Failed: $($package.Name)"
+            Write-Host "      [!] Failed: $($package.Name) - Retrying..."
+            Start-Sleep -Seconds 1
+            try {
+                Remove-AppxPackage -Package $package.PackageFullName -Force -ErrorAction SilentlyContinue
+                Write-Host "      [✓] Removed (retry): $($package.Name)"
+            } catch {
+                Write-Host "      [!] Still failed: $($package.Name)"
+            }
         }
     }
+    Start-Sleep -Seconds 2
 }
 
 # Remove provisioned packages
@@ -127,27 +140,44 @@ if ($provisionedPackages) {
 } else {
     Write-Host "      [✓] No provisioned packages found"
 }
+Start-Sleep -Seconds 1
 
 # Uninstall via registry
 if ($progs) {
     Write-Host "  [*] Running MSI uninstallers..."
     foreach ($app in $progs) {
         if ($app.PSChildName) {
-            msiexec.exe /x $app.PSChildName /quiet /norestart 2>$null
-            Write-Host "      [✓] Uninstalled: $($app.DisplayName)"
+            try {
+                Start-Process -FilePath "msiexec.exe" -ArgumentList "/x", $app.PSChildName, "/quiet", "/norestart" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                Write-Host "      [✓] Uninstalled: $($app.DisplayName)"
+            } catch {
+                Write-Host "      [!] Failed: $($app.DisplayName)"
+            }
         }
     }
+    Start-Sleep -Seconds 2
 }
 
-# Delete file paths
+# Delete file paths (with retry for locked files)
 if ($existingPaths.Count -gt 0) {
     Write-Host "  [*] Deleting file paths..."
     foreach ($path in $existingPaths) {
-        try {
-            Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "      [✓] Deleted: $path"
-        } catch {
-            Write-Host "      [!] Failed to delete: $path"
+        $retryCount = 0
+        $deleted = $false
+        while ($retryCount -lt 3 -and -not $deleted) {
+            try {
+                Remove-Item $path -Recurse -Force -ErrorAction Stop
+                Write-Host "      [✓] Deleted: $path"
+                $deleted = $true
+            } catch {
+                $retryCount++
+                if ($retryCount -lt 3) {
+                    Write-Host "      [*] Retrying (attempt $retryCount): $path"
+                    Start-Sleep -Seconds 2
+                } else {
+                    Write-Host "      [!] Failed to delete: $path (may require reboot)"
+                }
+            }
         }
     }
 }
@@ -173,12 +203,16 @@ Write-Host "      [✓] Removed startup entries"
 
 # Disable via Group Policy
 Write-Host "  [*] Disabling OneDrive policy..."
-$regPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
-if (-not (Test-Path $regPath)) {
-    New-Item -Path $regPath -Force | Out-Null
+try {
+    $regPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
+    if (-not (Test-Path $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $regPath -Name "DisableFileSyncNGSC" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+    Write-Host "      [✓] Disabled via policy"
+} catch {
+    Write-Host "      [!] Could not set policy (may be blocked by VPN/GPO)"
 }
-Set-ItemProperty -Path $regPath -Name "DisableFileSyncNGSC" -Value 1 -Type DWord -ErrorAction SilentlyContinue
-Write-Host "      [✓] Disabled via policy"
 
 # ============== PHASE 3: FINAL VERIFICATION ==============
 Write-Host "`n[PHASE 3] Final verification..." -ForegroundColor Yellow
@@ -223,6 +257,7 @@ Write-Host ""
 if ($appxRemaining -or $procRemaining -or $svcRemaining -or $fileRemaining -or $regRemaining) {
     Write-Host "[!] OneDrive still detected - REBOOT REQUIRED" -ForegroundColor Yellow
     Write-Host "    After reboot, run this script again or check with Qualys" -ForegroundColor Yellow
+    Write-Host "    If still connected to VPN: No need to disconnect, script works with VPN" -ForegroundColor Yellow
     exit 3010
 } else {
     Write-Host "[✓] OneDrive completely removed successfully!" -ForegroundColor Green
