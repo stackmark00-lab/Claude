@@ -1,8 +1,8 @@
 <#
     Remove-Webex.ps1
-    Purpose : Force-remove Cisco Webex (all variants) safely & idempotently
+    Purpose : Remove Cisco Webex ONLY (safely & idempotently, without affecting other Cisco apps)
     Author  : SecOps
-    Version : 2.0 (Security patched)
+    Version : 2.1 (Webex-only, AnyConnect safe)
     Exit codes:
       0     = Webex not found / successfully removed (no reboot needed)
       3010  = Removed and reboot recommended
@@ -13,13 +13,27 @@
 $Global:RebootRecommended = $false
 $LogRoot   = "C:\ProgramData\WebexRemoval"
 $LogFile   = Join-Path $LogRoot ("WebexRemoval_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+# WEBEX-ONLY patterns (excludes AnyConnect, Cisco VPN, etc.)
 $KillMatch = 'webex|ciscocollabhost|ptone|ptoneclk|atmgr|ciscowebex|wxm|wbx'
-$SvcMatch  = 'webex|cisco'
+$SvcMatch  = 'webex|ciscocollabhost'  # REMOVED generic 'cisco' to protect AnyConnect
+
+# Services to EXCLUDE (do not stop)
+$ExcludedServices = @(
+  'vpnagent',           # Cisco VPN
+  'anyconnect',         # Cisco AnyConnect
+  'acvpnagent',         # AnyConnect VPN
+  'ctrlpvtagent'        # Cisco ISE
+)
+
+# Registry paths
 $RegUninstallPaths = @(
   'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
   'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
   'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
+
+# Folders - WEBEX ONLY
 $Folders = @(
   "$env:LOCALAPPDATA\Webex",
   "$env:APPDATA\Webex",
@@ -29,6 +43,8 @@ $Folders = @(
   "$env:ProgramFiles(x86)\Cisco Webex",
   "$env:USERPROFILE\AppData\Local\Temp\WebEx"
 )
+
+# Registry keys - WEBEX ONLY
 $RegKeys = @(
   'HKCU:\Software\Webex',
   'HKLM:\Software\Webex'
@@ -104,33 +120,65 @@ function Test-WebexPresent {
 }
 
 function Kill-WebexProcesses {
-  Write-Host "Killing Webex/Cisco processes..."
+  Write-Host "Killing Webex processes..."
+  $killed = $false
+
   Get-Process -ErrorAction SilentlyContinue |
     Where-Object { $_.ProcessName -match "(?i)$KillMatch" } |
     ForEach-Object {
       try {
         Stop-Process -Id $_.Id -Force -ErrorAction Stop
         Write-Host "  Killed: $($_.ProcessName)"
+        $killed = $true
       } catch {
         Write-Host "  Could not kill: $($_.ProcessName) ($($_.Id)) - $_"
       }
     }
+
+  if (-not $killed) {
+    Write-Host "  No Webex processes found"
+  }
 }
 
 function Stop-WebexServices {
-  Write-Host "Stopping and disabling Webex/Cisco services..."
-  Get-Service | Where-Object { $_.DisplayName -match "(?i)$SvcMatch" -or $_.Name -match "(?i)$SvcMatch" } |
+  Write-Host "Stopping and disabling Webex services..."
+  $stopped = $false
+
+  Get-Service -ErrorAction SilentlyContinue |
+    Where-Object {
+      # Match Webex services ONLY
+      ($_.DisplayName -match '(?i)webex' -or $_.Name -match '(?i)webex' -or
+       $_.DisplayName -match '(?i)ciscocollabhost' -or $_.Name -match '(?i)ciscocollabhost') -and
+      # EXCLUDE protected Cisco apps
+      $_.Name -notin $ExcludedServices
+    } |
     ForEach-Object {
-      try { Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue } catch {}
-      try { Set-Service  -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
-      Write-Host "  Stopped/Disabled: $($_.DisplayName)"
+      try {
+        Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+        Write-Host "  Stopped: $($_.DisplayName)"
+        $stopped = $true
+      } catch {}
+      try {
+        Set-Service  -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
+        Write-Host "  Disabled: $($_.DisplayName)"
+      } catch {}
     }
+
+  if (-not $stopped) {
+    Write-Host "  No Webex services found"
+  }
 }
 
 function Uninstall-WebexProducts {
-  Write-Host "Running registered uninstallers..."
+  Write-Host "Running Webex uninstallers..."
+
   $targets = Get-ItemProperty $RegUninstallPaths -ErrorAction SilentlyContinue |
              Where-Object { $_.DisplayName -match '(?i)webex' }
+
+  if (-not $targets) {
+    Write-Host "  No Webex products found in registry"
+    return
+  }
 
   foreach ($app in $targets) {
     try {
@@ -139,27 +187,23 @@ function Uninstall-WebexProducts {
 
       # Try MSI ProductCode first (more reliable)
       if ($app.PSChildName -and (Test-ValidMSIProductCode -ProductCode $app.PSChildName)) {
-        Write-Host "  Uninstalling via MSI ProductCode: $($app.DisplayName)"
+        Write-Host "  Uninstalling via MSI: $($app.DisplayName)"
         $args = @('/x', $app.PSChildName, '/quiet', '/norestart')
         $uninstallMethod = 'msi'
       }
       # Fall back to UninstallString if it exists
       elseif ($app.UninstallString) {
-        $uninstallMethod = Parse-UninstallString -UninstallString $app.UninstallString
+        $uninstallMethod = Parse-UninstallString -UninstallString $app.UninstallString -DisplayName $app.DisplayName
 
-        if ($uninstallMethod -eq 'msi') {
-          Write-Host "  Uninstalling via MSI UninstallString: $($app.DisplayName)"
-          # This was already parsed and args prepared, use them from Parse function
-        } elseif ($uninstallMethod -eq 'exe') {
-          Write-Host "  Uninstalling via EXE: $($app.DisplayName)"
+        if ($uninstallMethod -eq 'exe') {
           # Already executed in Parse function
           continue
-        } else {
+        } elseif ($uninstallMethod -ne 'msi') {
           Write-Host "  Skipping unrecognized uninstall method for: $($app.DisplayName)"
           continue
         }
       } else {
-        Write-Host "  No valid uninstall method found for: $($app.DisplayName)"
+        Write-Host "  No valid uninstall method for: $($app.DisplayName)"
         continue
       }
 
@@ -183,7 +227,10 @@ function Test-ValidMSIProductCode {
 
 function Parse-UninstallString {
   [CmdletBinding()]
-  param([string]$UninstallString)
+  param(
+    [string]$UninstallString,
+    [string]$DisplayName
+  )
 
   if (-not $UninstallString) { return 'unknown' }
 
@@ -214,6 +261,7 @@ function Parse-UninstallString {
   if (Test-Path $uninst -PathType Leaf) {
     try {
       Start-Process -FilePath $uninst -ArgumentList '/S', '/quiet', '/qn', '/norestart' -Wait -NoNewWindow -ErrorAction SilentlyContinue
+      Write-Host "  Executed uninstaller: $DisplayName"
       return 'exe'
     } catch {
       Write-Host "    Could not execute: $uninst - $_"
@@ -227,18 +275,21 @@ function Parse-UninstallString {
 
 function Remove-WebexFiles {
   Write-Host "Deleting Webex folders..."
+  $deleted = $false
+
   foreach ($f in $Folders) {
     try {
       if (Test-Path $f) {
         # Retry with exponential backoff for locked files (up to 10 retries)
         $maxRetries = 10
         $retryDelays = @(1, 2, 4, 4, 4, 4, 4, 4, 4, 4)  # seconds
-        $deleted = $false
+        $folderDeleted = $false
 
         for ($i = 0; $i -lt $maxRetries; $i++) {
           try {
             Remove-Item $f -Recurse -Force -ErrorAction Stop
             Write-Host "  Deleted: $f"
+            $folderDeleted = $true
             $deleted = $true
             break
           } catch {
@@ -248,7 +299,7 @@ function Remove-WebexFiles {
           }
         }
 
-        if (-not $deleted -and (Test-Path $f)) {
+        if (-not $folderDeleted -and (Test-Path $f)) {
           Write-Host "  Still present (locked?): $f"
         }
       }
@@ -256,19 +307,30 @@ function Remove-WebexFiles {
       Write-Host "  Delete error: $f - $_"
     }
   }
+
+  if (-not $deleted) {
+    Write-Host "  No Webex folders found"
+  }
 }
 
 function Remove-WebexRegistry {
   Write-Host "Cleaning Webex registry keys..."
+  $cleaned = $false
+
   foreach ($rk in $RegKeys) {
     try {
       if (Test-Path $rk) {
         Remove-Item $rk -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host "  Cleaned: $rk"
+        $cleaned = $true
       }
     } catch {
       Write-Host "  Registry delete error: $rk - $_"
     }
+  }
+
+  if (-not $cleaned) {
+    Write-Host "  No Webex registry keys found"
   }
 }
 
@@ -278,8 +340,9 @@ try {
   Assert-Administrator
 
   Ensure-Log
-  Write-Host "=== Webex Force Removal - Start === $(Get-Date)"
+  Write-Host "=== Webex Force Removal (WEBEX ONLY) - Start === $(Get-Date)" -ForegroundColor Cyan
   Write-Host "User: $($env:USERNAME) | Computer: $($env:COMPUTERNAME)" -ForegroundColor Cyan
+  Write-Host "WARNING: This will ONLY remove Webex. Other Cisco apps (AnyConnect, VPN) are protected." -ForegroundColor Yellow
 
   Kill-WebexProcesses
   Stop-WebexServices
@@ -296,7 +359,7 @@ try {
     Write-Host "`nWebex fully removed." -ForegroundColor Green
   }
 
-  Write-Host "=== Webex Force Removal - End === $(Get-Date)"
+  Write-Host "=== Webex Force Removal - End === $(Get-Date)" -ForegroundColor Cyan
   Stop-Log
 
   if ($Global:RebootRecommended) { exit 3010 } else { exit 0 }
